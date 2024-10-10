@@ -15,11 +15,13 @@
 package rtc
 
 import (
+	"io"
 	"math/bits"
 	"sync"
 	"time"
 
 	"github.com/pion/rtcp"
+	"github.com/pion/sctp"
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v3"
 	"github.com/pkg/errors"
@@ -29,12 +31,14 @@ import (
 	"github.com/livekit/mediatransportutil/pkg/twcc"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/utils"
 
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/rtc/transport"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/sfu"
 	"github.com/livekit/livekit-server/pkg/sfu/pacer"
+	"github.com/livekit/livekit-server/pkg/telemetry"
 )
 
 const (
@@ -88,6 +92,7 @@ type TransportManagerParams struct {
 	Logger                       logger.Logger
 	PublisherHandler             transport.Handler
 	SubscriberHandler            transport.Handler
+	DataChannelStats             *telemetry.BytesTrackStats
 }
 
 type TransportManager struct {
@@ -241,7 +246,19 @@ func (t *TransportManager) RemoveSubscribedTrack(subTrack types.SubscribedTrack)
 
 func (t *TransportManager) SendDataPacket(kind livekit.DataPacket_Kind, encoded []byte) error {
 	// downstream data is sent via primary peer connection
-	return t.getTransport(true).SendDataPacket(kind, encoded)
+	err := t.getTransport(true).SendDataPacket(kind, encoded)
+	if err != nil {
+		if !utils.ErrorIsOneOf(err, io.ErrClosedPipe, sctp.ErrStreamClosed, ErrTransportFailure, ErrDataChannelBufferFull) {
+			t.params.Logger.Warnw("send data packet error", err)
+		}
+		if utils.ErrorIsOneOf(err, sctp.ErrStreamClosed, io.ErrClosedPipe) {
+			t.params.SubscriberHandler.OnDataSendError(err)
+		}
+	} else {
+		t.params.DataChannelStats.AddBytes(uint64(len(encoded)), true)
+	}
+
+	return err
 }
 
 func (t *TransportManager) createDataChannelsForSubscriber(pendingDataChannels []*livekit.DataChannelInfo) error {
@@ -439,7 +456,7 @@ func (t *TransportManager) GetICEConfig() *livekit.ICEConfig {
 	if t.iceConfig == nil {
 		return nil
 	}
-	return proto.Clone(t.iceConfig).(*livekit.ICEConfig)
+	return utils.CloneProto(t.iceConfig)
 }
 
 func (t *TransportManager) resetTransportConfigureLocked(reconfigured bool) {
@@ -461,7 +478,7 @@ func (t *TransportManager) configureICE(iceConfig *livekit.ICEConfig, reset bool
 		return
 	}
 
-	t.params.Logger.Infow("setting ICE config", "iceConfig", iceConfig)
+	t.params.Logger.Infow("setting ICE config", "iceConfig", logger.Proto(iceConfig))
 	onICEConfigChanged := t.onICEConfigChanged
 	t.iceConfig = iceConfig
 	t.lock.Unlock()
@@ -482,15 +499,15 @@ func (t *TransportManager) SubscriberAsPrimary() bool {
 	return t.params.SubscriberAsPrimary
 }
 
-func (t *TransportManager) GetICEConnectionDetails() []*types.ICEConnectionDetails {
-	details := make([]*types.ICEConnectionDetails, 0, 2)
+func (t *TransportManager) GetICEConnectionInfo() []*types.ICEConnectionInfo {
+	infos := make([]*types.ICEConnectionInfo, 0, 2)
 	for _, pc := range []*PCTransport{t.publisher, t.subscriber} {
-		cd := pc.GetICEConnectionDetails()
-		if cd.HasCandidates() {
-			details = append(details, cd.Clone())
+		info := pc.GetICEConnectionInfo()
+		if info.HasCandidates() {
+			infos = append(infos, info)
 		}
 	}
-	return details
+	return infos
 }
 
 func (t *TransportManager) getTransport(isPrimary bool) *PCTransport {

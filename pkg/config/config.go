@@ -27,6 +27,7 @@ import (
 	"github.com/urfave/cli/v2"
 	"gopkg.in/yaml.v3"
 
+	"github.com/livekit/livekit-server/pkg/metric"
 	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
@@ -85,6 +86,8 @@ type Config struct {
 	Limit    LimitConfig   `yaml:"limit,omitempty"`
 
 	Development bool `yaml:"development,omitempty"`
+
+	Metric metric.MetricConfig `yaml:"metric,omitempty"`
 }
 
 type RTCConfig struct {
@@ -295,6 +298,7 @@ type SignalRelayConfig struct {
 	MinRetryInterval time.Duration `yaml:"min_retry_interval,omitempty"`
 	MaxRetryInterval time.Duration `yaml:"max_retry_interval,omitempty"`
 	StreamBufferSize int           `yaml:"stream_buffer_size,omitempty"`
+	ConnectAttempts  int           `yaml:"connect_attempts,omitempty"`
 }
 
 // RegionConfig lists available regions and their latitude/longitude, so the selector would prefer
@@ -542,6 +546,7 @@ var DefaultConfig = Config{
 		},
 		EmptyTimeout:       5 * 60,
 		DepartureTimeout:   20,
+		CreateRoomEnabled:  true,
 		CreateRoomTimeout:  10 * time.Second,
 		CreateRoomAttempts: 3,
 	},
@@ -569,9 +574,11 @@ var DefaultConfig = Config{
 		MinRetryInterval: 500 * time.Millisecond,
 		MaxRetryInterval: 4 * time.Second,
 		StreamBufferSize: 1000,
+		ConnectAttempts:  3,
 	},
-	PSRPC: rpc.DefaultPSRPCConfig,
-	Keys:  map[string]string{},
+	PSRPC:  rpc.DefaultPSRPCConfig,
+	Keys:   map[string]string{},
+	Metric: metric.DefaultMetricConfig,
 }
 
 func NewConfig(confString string, strictMode bool, c *cli.Context, baseFlags []cli.Flag) (*Config, error) {

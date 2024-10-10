@@ -22,7 +22,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bep/debounce"
 	"github.com/pion/dtls/v2/pkg/crypto/elliptic"
 	"github.com/pion/ice/v2"
 	"github.com/pion/interceptor"
@@ -35,6 +34,7 @@ import (
 	"github.com/pion/webrtc/v3"
 	"github.com/pkg/errors"
 	"go.uber.org/atomic"
+	"go.uber.org/zap/zapcore"
 
 	lkinterceptor "github.com/livekit/mediatransportutil/pkg/interceptor"
 	lktwcc "github.com/livekit/mediatransportutil/pkg/twcc"
@@ -59,6 +59,7 @@ const (
 	LossyDataChannel    = "_lossy"
 	ReliableDataChannel = "_reliable"
 
+	fastNegotiationFrequency   = 10 * time.Millisecond
 	negotiationFrequency       = 150 * time.Millisecond
 	negotiationFailedTimeout   = 15 * time.Second
 	dtlsRetransmissionInterval = 100 * time.Millisecond
@@ -131,6 +132,30 @@ func (e event) String() string {
 
 // -------------------------------------------------------
 
+type wrappedICECandidatePairLogger struct {
+	pair *webrtc.ICECandidatePair
+}
+
+func (w wrappedICECandidatePairLogger) MarshalLogObject(e zapcore.ObjectEncoder) error {
+	if w.pair == nil {
+		return nil
+	}
+
+	if w.pair.Local != nil {
+		e.AddString("localProtocol", w.pair.Local.Protocol.String())
+		e.AddString("localCandidateType", w.pair.Local.Typ.String())
+		e.AddString("localAdddress", w.pair.Local.Address)
+		e.AddUint16("localPort", w.pair.Local.Port)
+	}
+	if w.pair.Remote != nil {
+		e.AddString("remoteProtocol", w.pair.Remote.Protocol.String())
+		e.AddString("remoteCandidateType", w.pair.Remote.Typ.String())
+	}
+	return nil
+}
+
+// -------------------------------------------------------------------
+
 type SimulcastTrackInfo struct {
 	Mid string
 	Rid string
@@ -165,7 +190,7 @@ type PCTransport struct {
 	resetShortConnOnICERestart atomic.Bool
 	signalingRTT               atomic.Uint32 // milliseconds
 
-	debouncedNegotiate func(func())
+	debouncedNegotiate *sfuutils.Debouncer
 	debouncePending    bool
 	lastNegotiate      time.Time
 
@@ -200,6 +225,7 @@ type PCTransport struct {
 	pendingRestartIceOffer    *webrtc.SessionDescription
 
 	connectionDetails *types.ICEConnectionDetails
+	selectedPair      atomic.Pointer[webrtc.ICECandidatePair]
 }
 
 type TransportParams struct {
@@ -389,7 +415,7 @@ func NewPCTransport(params TransportParams) (*PCTransport, error) {
 	}
 	t := &PCTransport{
 		params:             params,
-		debouncedNegotiate: debounce.New(negotiationFrequency),
+		debouncedNegotiate: sfuutils.NewDebouncer(negotiationFrequency),
 		negotiationState:   transport.NegotiationStateNone,
 		eventsQueue: utils.NewTypedOpsQueue[event](utils.OpsQueueParams{
 			Name:    "transport",
@@ -438,6 +464,12 @@ func (t *PCTransport) createPeerConnection() error {
 
 	t.pc.OnDataChannel(t.onDataChannel)
 	t.pc.OnTrack(t.params.Handler.OnTrack)
+
+	t.pc.SCTP().Transport().ICETransport().OnSelectedCandidatePairChange(func(pair *webrtc.ICECandidatePair) {
+		t.params.Logger.Debugw("selected ICE candidate pair changed", "pair", wrappedICECandidatePairLogger{pair})
+		t.connectionDetails.SetSelectedPair(pair)
+		t.selectedPair.Store(pair)
+	})
 
 	t.me = me
 
@@ -550,34 +582,6 @@ func (t *PCTransport) IsShortConnection(at time.Time) (bool, time.Duration) {
 	return duration < shortConnectionThreshold, duration
 }
 
-func (t *PCTransport) getSelectedPair() (*webrtc.ICECandidatePair, error) {
-	s := t.pc.SCTP()
-	if s == nil {
-		return nil, errors.New("no SCTP")
-	}
-
-	dtlsTransport := s.Transport()
-	if dtlsTransport == nil {
-		return nil, errors.New("no DTLS transport")
-	}
-
-	iceTransport := dtlsTransport.ICETransport()
-	if iceTransport == nil {
-		return nil, errors.New("no ICE transport")
-	}
-
-	pair, err := iceTransport.GetSelectedCandidatePair()
-	if err != nil {
-		return nil, err
-	}
-
-	if pair == nil {
-		return nil, errors.New("no selected pair")
-	}
-
-	return pair, err
-}
-
 func (t *PCTransport) setConnectedAt(at time.Time) bool {
 	t.lock.Lock()
 	t.connectedAt = at
@@ -616,8 +620,7 @@ func (t *PCTransport) handleConnectionFailed(forceShortConn bool) {
 		var duration time.Duration
 		isShort, duration = t.IsShortConnection(time.Now())
 		if isShort {
-			pair, err := t.getSelectedPair()
-			t.params.Logger.Debugw("short ICE connection", "error", err, "pair", pair, "duration", duration)
+			t.params.Logger.Debugw("short ICE connection", "pair", wrappedICECandidatePairLogger{t.selectedPair.Load()}, "duration", duration)
 		}
 	}
 
@@ -629,14 +632,6 @@ func (t *PCTransport) onICEConnectionStateChange(state webrtc.ICEConnectionState
 	switch state {
 	case webrtc.ICEConnectionStateConnected:
 		t.setICEConnectedAt(time.Now())
-		go func() {
-			pair, err := t.getSelectedPair()
-			if err != nil {
-				t.params.Logger.Warnw("failed to get selected candidate pair", err)
-				return
-			}
-			t.connectionDetails.SetSelectedPair(pair)
-		}()
 
 	case webrtc.ICEConnectionStateChecking:
 		t.setICEStartedAt(time.Now())
@@ -653,6 +648,8 @@ func (t *PCTransport) onPeerConnectionStateChange(state webrtc.PeerConnectionSta
 			t.params.Handler.OnInitialConnected()
 
 			t.maybeNotifyFullyEstablished()
+		} else {
+			t.params.Logger.Infow("ice reconnected", "pair", wrappedICECandidatePairLogger{t.selectedPair.Load()})
 		}
 	case webrtc.PeerConnectionStateFailed:
 		t.clearConnTimer()
@@ -911,8 +908,8 @@ func (t *PCTransport) HasEverConnected() bool {
 	return !t.firstConnectedAt.IsZero()
 }
 
-func (t *PCTransport) GetICEConnectionDetails() *types.ICEConnectionDetails {
-	return t.connectionDetails
+func (t *PCTransport) GetICEConnectionInfo() *types.ICEConnectionInfo {
+	return t.connectionDetails.GetInfo()
 }
 
 func (t *PCTransport) WriteRTCP(pkts []rtcp.Packet) error {
@@ -1004,20 +1001,26 @@ func (t *PCTransport) Negotiate(force bool) {
 
 	var postEvent bool
 	t.lock.Lock()
-	if force || (!t.debouncePending && time.Since(t.lastNegotiate) > negotiationFrequency) {
-		t.debouncedNegotiate(func() {
+	if force {
+		t.debouncedNegotiate.Add(func() {
 			// no op to cancel pending negotiation
 		})
 		t.debouncePending = false
-		t.lastNegotiate = time.Now()
+		t.updateLastNeogitateLocked()
 
 		postEvent = true
 	} else {
 		if !t.debouncePending {
-			t.debouncedNegotiate(func() {
+			if time.Since(t.lastNegotiate) > negotiationFrequency {
+				t.debouncedNegotiate.SetDuration(fastNegotiationFrequency)
+			} else {
+				t.debouncedNegotiate.SetDuration(negotiationFrequency)
+			}
+
+			t.debouncedNegotiate.Add(func() {
 				t.lock.Lock()
 				t.debouncePending = false
-				t.lastNegotiate = time.Now()
+				t.updateLastNeogitateLocked()
 				t.lock.Unlock()
 
 				t.postEvent(event{
@@ -1033,6 +1036,12 @@ func (t *PCTransport) Negotiate(force bool) {
 		t.postEvent(event{
 			signal: signalSendOffer,
 		})
+	}
+}
+
+func (t *PCTransport) updateLastNeogitateLocked() {
+	if now := time.Now(); now.After(t.lastNegotiate) {
+		t.lastNegotiate = now
 	}
 }
 
@@ -1234,6 +1243,10 @@ func (t *PCTransport) SetPreviousSdp(offer, answer *webrtc.SessionDescription) {
 			}
 		}
 	}
+	// disable fast negotiation temporarily after migration to avoid sending offer
+	// contains part of subscribed tracks before migration, let the subscribed track
+	// resume at the same time.
+	t.lastNegotiate = time.Now().Add(iceFailedTimeoutTotal)
 	t.lock.Unlock()
 }
 

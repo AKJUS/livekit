@@ -12,11 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package buffer
+package metric
 
-import "github.com/livekit/livekit-server/pkg/sfu/rtpstats"
+// ------------------------------------------------
 
-type StreamStatsWithLayers struct {
-	RTPStats *rtpstats.RTPDeltaInfo
-	Layers   map[int32]*rtpstats.RTPDeltaInfo
+type MetricConfig struct {
+	Timestamper MetricTimestamperConfig `yaml:"timestamper_config,omitempty"`
 }
+
+var (
+	DefaultMetricConfig = MetricConfig{
+		Timestamper: DefaultMetricTimestamperConfig,
+	}
+)

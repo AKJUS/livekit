@@ -30,7 +30,6 @@ import (
 	"go.uber.org/atomic"
 	"golang.org/x/exp/maps"
 
-	"github.com/livekit/livekit-server/pkg/agent"
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/livekit-server/pkg/routing/selector"
@@ -40,13 +39,6 @@ import (
 	"github.com/livekit/livekit-server/pkg/utils"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/psrpc"
-)
-
-const (
-	// TODO: make these configurable
-	initialBackoffSeconds   = 1
-	maxBackoffSecondsPow    = 6 // 64 seconds
-	startConnectionMaxTries = 3
 )
 
 type RTCService struct {
@@ -59,7 +51,6 @@ type RTCService struct {
 	isDev         bool
 	limits        config.LimitConfig
 	parser        *uaparser.Parser
-	agentClient   agent.Client
 	telemetry     telemetry.TelemetryService
 
 	mu          sync.Mutex
@@ -72,7 +63,6 @@ func NewRTCService(
 	store ServiceStore,
 	router routing.MessageRouter,
 	currentNode routing.LocalNode,
-	agentClient agent.Client,
 	telemetry telemetry.TelemetryService,
 ) *RTCService {
 	s := &RTCService{
@@ -85,7 +75,6 @@ func NewRTCService(
 		isDev:         conf.Development,
 		limits:        conf.Limit,
 		parser:        uaparser.NewFromSaved(),
-		agentClient:   agentClient,
 		telemetry:     telemetry,
 		connections:   map[*websocket.Conn]struct{}{},
 	}
@@ -236,26 +225,12 @@ func (s *RTCService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// give it a few attempts to start session
 	var cr connectionResult
 	var initialResponse *livekit.SignalResponse
-	for attempt := 0; attempt < startConnectionMaxTries && r.Context().Err() == nil; attempt++ {
+	for attempt := 0; attempt < s.config.SignalRelay.ConnectAttempts; attempt++ {
 		connectionTimeout := 3 * time.Second * time.Duration(attempt+1)
 		ctx := utils.ContextWithAttempt(r.Context(), attempt)
 		cr, initialResponse, err = s.startConnection(ctx, roomName, pi, connectionTimeout)
 		if err == nil || errors.Is(err, context.Canceled) {
 			break
-		}
-
-		if attempt < startConnectionMaxTries-1 {
-			// exponential backoff delay. powers of 2.
-			backoffDelay := time.NewTimer(time.Duration(initialBackoffSeconds<<min(attempt, maxBackoffSecondsPow)) * time.Second)
-			pLogger.Warnw("failed to start connection, retrying", err,
-				"attempt", attempt,
-				"backoffDelay", backoffDelay,
-			)
-			select {
-			case <-backoffDelay.C: // wait for backoff
-			case <-ctx.Done():
-				backoffDelay.Stop()
-			}
 		}
 	}
 
@@ -275,6 +250,12 @@ func (s *RTCService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if join := initialResponse.GetJoin(); join != nil {
 		signalStats.ResolveRoom(join.GetRoom())
 		signalStats.ResolveParticipant(join.GetParticipant())
+	}
+	if pi.Reconnect && pi.ID != "" {
+		signalStats.ResolveParticipant(&livekit.ParticipantInfo{
+			Sid:      string(pi.ID),
+			Identity: string(pi.Identity),
+		})
 	}
 
 	closedByClient := atomic.NewBool(false)

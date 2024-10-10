@@ -30,6 +30,7 @@ import (
 	"github.com/pion/transport/v2/packetio"
 	"github.com/pion/webrtc/v3"
 	"go.uber.org/atomic"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
@@ -40,6 +41,7 @@ import (
 	act "github.com/livekit/livekit-server/pkg/sfu/rtpextension/abscapturetime"
 	dd "github.com/livekit/livekit-server/pkg/sfu/rtpextension/dependencydescriptor"
 	pd "github.com/livekit/livekit-server/pkg/sfu/rtpextension/playoutdelay"
+	"github.com/livekit/livekit-server/pkg/sfu/rtpstats"
 	"github.com/livekit/livekit-server/pkg/sfu/utils"
 )
 
@@ -61,7 +63,7 @@ type TrackSender interface {
 		payloadType webrtc.PayloadType,
 		isSVC bool,
 		layer int32,
-		publisherSRData *buffer.RTCPSenderReportData,
+		publisherSRData *livekit.RTCPSenderReportState,
 	) error
 	Resync()
 }
@@ -135,14 +137,16 @@ var (
 // -------------------------------------------------------------------
 
 type DownTrackState struct {
-	RTPStats                   *buffer.RTPStatsSender
+	RTPStats                   *rtpstats.RTPStatsSender
 	DeltaStatsSenderSnapshotId uint32
 	ForwarderState             *livekit.RTPForwarderState
 }
 
-func (d DownTrackState) String() string {
-	return fmt.Sprintf("DownTrackState{rtpStats: %s, deltaSender: %d, forwarder: %s}",
-		d.RTPStats, d.DeltaStatsSenderSnapshotId, d.ForwarderState.String())
+func (d DownTrackState) MarshalLogObject(e zapcore.ObjectEncoder) error {
+	e.AddObject("RTPStats", d.RTPStats)
+	e.AddUint32("DeltaStatsSenderSnapshotId", d.DeltaStatsSenderSnapshotId)
+	e.AddObject("ForwarderState", logger.Proto(d.ForwarderState))
+	return nil
 }
 
 // -------------------------------------------------------------------
@@ -238,6 +242,7 @@ type DownTrack struct {
 
 	upstreamCodecs []webrtc.RTPCodecParameters
 	codec          webrtc.RTPCodecCapability
+	clockRate      uint32
 
 	// payload types for red codec only
 	isRED             bool
@@ -268,7 +273,7 @@ type DownTrack struct {
 	writeStopped         atomic.Bool
 	isReceiverReady      bool
 
-	rtpStats *buffer.RTPStatsSender
+	rtpStats *rtpstats.RTPStatsSender
 
 	totalRepeatedNACKs atomic.Uint32
 
@@ -353,6 +358,7 @@ func NewDownTrack(params DowntrackParams) (*DownTrack, error) {
 		upstreamCodecs:      codecs,
 		kind:                kind,
 		codec:               codecs[0].RTPCodecCapability,
+		clockRate:           codecs[0].ClockRate,
 		pacer:               params.Pacer,
 		maxLayerNotifierCh:  make(chan string, 1),
 		keyFrameRequesterCh: make(chan struct{}, 1),
@@ -360,7 +366,6 @@ func NewDownTrack(params DowntrackParams) (*DownTrack, error) {
 	}
 	d.bindState.Store(bindStateUnbound)
 	d.params.Logger = params.Logger.WithValues(
-		"mime", codecs[0].MimeType,
 		"subscriberID", d.SubscriberID(),
 	)
 	d.forwarder = NewForwarder(
@@ -370,7 +375,7 @@ func NewDownTrack(params DowntrackParams) (*DownTrack, error) {
 		d.getExpectedRTPTimestamp,
 	)
 
-	d.rtpStats = buffer.NewRTPStatsSender(buffer.RTPStatsParams{
+	d.rtpStats = rtpstats.NewRTPStatsSender(rtpstats.RTPStatsParams{
 		ClockRate: d.codec.ClockRate,
 		Logger:    d.params.Logger,
 	})
@@ -530,7 +535,7 @@ func (d *DownTrack) Bind(t webrtc.TrackLocalContext) (webrtc.RTPCodecParameters,
 		d.setBindStateLocked(bindStateBound)
 		d.bindLock.Unlock()
 
-		d.forwarder.DetermineCodec(d.codec, d.params.Receiver.HeaderExtensions())
+		d.forwarder.DetermineCodec(codec.RTPCodecCapability, d.params.Receiver.HeaderExtensions())
 		d.params.Logger.Debugw("downtrack bound")
 	}
 
@@ -668,7 +673,11 @@ func (d *DownTrack) ClearStreamAllocatorReportInterval() {
 func (d *DownTrack) ID() string { return string(d.id) }
 
 // Codec returns current track codec capability
-func (d *DownTrack) Codec() webrtc.RTPCodecCapability { return d.codec }
+func (d *DownTrack) Codec() webrtc.RTPCodecCapability {
+	d.bindLock.Lock()
+	defer d.bindLock.Unlock()
+	return d.codec
+}
 
 // StreamID is the group this track belongs too. This must be unique
 func (d *DownTrack) StreamID() string { return d.params.StreamID }
@@ -905,7 +914,7 @@ func (d *DownTrack) WriteRTP(extPkt *buffer.ExtPacket, layer int32) error {
 		_, _, refSenderReport := d.forwarder.GetSenderReportParams()
 		if refSenderReport != nil {
 			actExtCopy := *extPkt.AbsCaptureTimeExt
-			if err = actExtCopy.Rewrite(refSenderReport.PropagationDelay(!d.params.DisableSenderReportPassThrough)); err == nil {
+			if err = actExtCopy.Rewrite(rtpstats.RTCPSenderReportPropagationDelay(refSenderReport, !d.params.DisableSenderReportPassThrough)); err == nil {
 				actBytes, err = actExtCopy.Marshal()
 				if err == nil {
 					extensions = append(
@@ -1245,6 +1254,9 @@ func (d *DownTrack) GetState() DownTrackState {
 }
 
 func (d *DownTrack) SeedState(state DownTrackState) {
+	if state.RTPStats != nil || state.ForwarderState != nil {
+		d.params.Logger.Debugw("seeding down track state", "state", state)
+	}
 	if state.RTPStats != nil {
 		d.rtpStats.Seed(state.RTPStats)
 		d.deltaStatsSenderSnapshotId = state.DeltaStatsSenderSnapshotId
@@ -1748,7 +1760,7 @@ func (d *DownTrack) handleRTCP(bytes []byte) {
 					d.playoutDelay.OnSeqAcked(uint16(r.LastSequenceNumber))
 					// screen share track has inaccuracy jitter due to its low frame rate and bursty traffic
 					if d.params.Source != livekit.TrackSource_SCREEN_SHARE {
-						jitterMs := uint64(r.Jitter*1e3) / uint64(d.codec.ClockRate)
+						jitterMs := uint64(r.Jitter*1e3) / uint64(d.clockRate)
 						d.playoutDelay.SetJitter(uint32(jitterMs))
 					}
 				}
@@ -2045,7 +2057,7 @@ func (d *DownTrack) GetTrackStats() *livekit.RTPStats {
 	return d.rtpStats.ToProto()
 }
 
-func (d *DownTrack) deltaStats(ds *buffer.RTPDeltaInfo) map[uint32]*buffer.StreamStatsWithLayers {
+func (d *DownTrack) deltaStats(ds *rtpstats.RTPDeltaInfo) map[uint32]*buffer.StreamStatsWithLayers {
 	if ds == nil {
 		return nil
 	}
@@ -2053,7 +2065,7 @@ func (d *DownTrack) deltaStats(ds *buffer.RTPDeltaInfo) map[uint32]*buffer.Strea
 	streamStats := make(map[uint32]*buffer.StreamStatsWithLayers, 1)
 	streamStats[d.ssrc] = &buffer.StreamStatsWithLayers{
 		RTPStats: ds,
-		Layers: map[int32]*buffer.RTPDeltaInfo{
+		Layers: map[int32]*rtpstats.RTPDeltaInfo{
 			0: ds,
 		},
 	}
@@ -2070,11 +2082,11 @@ func (d *DownTrack) GetLastReceiverReportTime() time.Time {
 }
 
 func (d *DownTrack) GetTotalPacketsSent() uint64 {
-	return d.rtpStats.GetTotalPacketsPrimary()
+	return d.rtpStats.GetPacketsSeenMinusPadding()
 }
 
 func (d *DownTrack) GetNackStats() (totalPackets uint32, totalRepeatedNACKs uint32) {
-	totalPackets = uint32(d.rtpStats.GetTotalPacketsPrimary())
+	totalPackets = uint32(d.rtpStats.GetPacketsSeenMinusPadding())
 	totalRepeatedNACKs = d.totalRepeatedNACKs.Load()
 	return
 }
@@ -2191,7 +2203,7 @@ func (d *DownTrack) HandleRTCPSenderReportData(
 	_payloadType webrtc.PayloadType,
 	isSVC bool,
 	layer int32,
-	publisherSRData *buffer.RTCPSenderReportData,
+	publisherSRData *livekit.RTCPSenderReportState,
 ) error {
 	d.forwarder.SetRefSenderReport(isSVC, layer, publisherSRData)
 
@@ -2202,7 +2214,7 @@ func (d *DownTrack) HandleRTCPSenderReportData(
 	return nil
 }
 
-func (d *DownTrack) handleRTCPSenderReportData(publisherSRData *buffer.RTCPSenderReportData, tsOffset uint64) {
+func (d *DownTrack) handleRTCPSenderReportData(publisherSRData *livekit.RTCPSenderReportState, tsOffset uint64) {
 	d.rtpStats.MaybeAdjustFirstPacketTime(publisherSRData, tsOffset)
 }
 

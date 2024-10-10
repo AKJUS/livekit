@@ -24,17 +24,18 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v3"
 	"go.uber.org/atomic"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/livekit/mediatransportutil/pkg/bucket"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/utils"
 
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/sfu/audio"
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
 	"github.com/livekit/livekit-server/pkg/sfu/connectionquality"
 	dd "github.com/livekit/livekit-server/pkg/sfu/rtpextension/dependencydescriptor"
+	"github.com/livekit/livekit-server/pkg/sfu/rtpstats"
 )
 
 var (
@@ -186,6 +187,7 @@ func WithForwardStats(forwardStats *ForwardStats) ReceiverOpts {
 // NewWebRTCReceiver creates a new webrtc track receiver
 func NewWebRTCReceiver(
 	receiver *webrtc.RTPReceiver,
+	baseTime time.Time,
 	track *webrtc.TrackRemote,
 	trackInfo *livekit.TrackInfo,
 	logger logger.Logger,
@@ -194,6 +196,7 @@ func NewWebRTCReceiver(
 	opts ...ReceiverOpts,
 ) *WebRTCReceiver {
 	w := &WebRTCReceiver{
+		baseTime: baseTime,
 		logger:   logger,
 		receiver: receiver,
 		trackID:  livekit.TrackID(track.ID()),
@@ -203,13 +206,12 @@ func NewWebRTCReceiver(
 		onRTCP:   onRTCP,
 		isSVC:    buffer.IsSvcCodec(track.Codec().MimeType),
 		isRED:    buffer.IsRedCodec(track.Codec().MimeType),
-		baseTime: time.Now(),
 	}
 
 	for _, opt := range opts {
 		w = opt(w)
 	}
-	w.trackInfo.Store(proto.Clone(trackInfo).(*livekit.TrackInfo))
+	w.trackInfo.Store(utils.CloneProto(trackInfo))
 
 	w.downTrackSpreader = NewDownTrackSpreader(DownTrackSpreaderParams{
 		Threshold: w.lbThreshold,
@@ -249,7 +251,7 @@ func (w *WebRTCReceiver) TrackInfo() *livekit.TrackInfo {
 }
 
 func (w *WebRTCReceiver) UpdateTrackInfo(ti *livekit.TrackInfo) {
-	w.trackInfo.Store(proto.Clone(ti).(*livekit.TrackInfo))
+	w.trackInfo.Store(utils.CloneProto(ti))
 	w.streamTrackerManager.UpdateTrackInfo(ti)
 }
 
@@ -596,7 +598,7 @@ func (w *WebRTCReceiver) GetTrackStats() *livekit.RTPStats {
 		stats = append(stats, sswl)
 	}
 
-	return buffer.AggregateRTPStats(stats)
+	return rtpstats.AggregateRTPStats(stats)
 }
 
 func (w *WebRTCReceiver) GetAudioLevel() (float64, bool) {
@@ -635,7 +637,7 @@ func (w *WebRTCReceiver) GetDeltaStats() map[uint32]*buffer.StreamStatsWithLayer
 		}
 
 		// patch buffer stats with correct layer
-		patched := make(map[int32]*buffer.RTPDeltaInfo, 1)
+		patched := make(map[int32]*rtpstats.RTPDeltaInfo, 1)
 		patched[int32(layer)] = sswl.Layers[0]
 		sswl.Layers = patched
 

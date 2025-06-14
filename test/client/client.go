@@ -16,6 +16,8 @@ package client
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -113,6 +115,7 @@ var (
 type Options struct {
 	AutoSubscribe             bool
 	Publish                   string
+	Attributes                map[string]string
 	ClientInfo                *livekit.ClientInfo
 	DisabledCodecs            []webrtc.RTPCodecCapability
 	TokenCustomizer           func(token *auth.AccessToken, grants *auth.VideoGrant)
@@ -134,6 +137,13 @@ func NewWebSocketConn(host, token string, opts *Options) (*websocket.Conn, error
 		connectUrl = fmt.Sprintf("%s&auto_subscribe=%t", connectUrl, opts.AutoSubscribe)
 		if opts.Publish != "" {
 			connectUrl += encodeQueryParam("publish", opts.Publish)
+		}
+		if len(opts.Attributes) != 0 {
+			data, err := json.Marshal(opts.Attributes)
+			if err != nil {
+				return nil, err
+			}
+			connectUrl += encodeQueryParam("attributes", base64.URLEncoding.EncodeToString(data))
 		}
 		if opts.ClientInfo != nil {
 			if opts.ClientInfo.DeviceModel != "" {
@@ -308,7 +318,7 @@ func NewRTCClient(conn *websocket.Conn, opts *Options) (*RTCClient, error) {
 		logger.Debugw("subscriber fully established", "participant", c.localParticipant.Identity, "pID", c.localParticipant.Sid)
 		c.subscriberFullyEstablished.Store(true)
 	})
-	subscriberHandler.OnAnswerCalls(func(answer webrtc.SessionDescription) error {
+	subscriberHandler.OnAnswerCalls(func(answer webrtc.SessionDescription, answerId uint32) error {
 		// send remote an answer
 		logger.Infow("sending subscriber answer",
 			"participant", c.localParticipant.Identity,
@@ -316,7 +326,7 @@ func NewRTCClient(conn *websocket.Conn, opts *Options) (*RTCClient, error) {
 		)
 		return c.SendRequest(&livekit.SignalRequest{
 			Message: &livekit.SignalRequest_Answer{
-				Answer: rtc.ToProtoSessionDescription(answer),
+				Answer: rtc.ToProtoSessionDescription(answer, answerId),
 			},
 		})
 	})
@@ -345,7 +355,7 @@ func (c *RTCClient) Run() error {
 	// run the session
 	for {
 		res, err := c.ReadResponse()
-		if errors.Is(io.EOF, err) {
+		if errors.Is(err, io.EOF) {
 			return nil
 		} else if err != nil {
 			logger.Errorw("error while reading", err)
@@ -390,8 +400,8 @@ func (c *RTCClient) handleSignalResponse(res *livekit.SignalResponse) error {
 		logger.Infow("received server offer",
 			"participant", c.localParticipant.Identity,
 		)
-		desc := rtc.FromProtoSessionDescription(msg.Offer)
-		c.handleOffer(desc)
+		desc, offerId := rtc.FromProtoSessionDescription(msg.Offer)
+		c.handleOffer(desc, offerId)
 	case *livekit.SignalResponse_Trickle:
 		candidateInit, err := rtc.FromProtoTrickle(msg.Trickle)
 		if err != nil {
@@ -817,26 +827,26 @@ func (c *RTCClient) handleDataMessageUnlabeled(data []byte) {
 }
 
 // handles a server initiated offer, handle on subscriber PC
-func (c *RTCClient) handleOffer(desc webrtc.SessionDescription) {
-	c.subscriber.HandleRemoteDescription(desc)
+func (c *RTCClient) handleOffer(desc webrtc.SessionDescription, offerId uint32) {
+	c.subscriber.HandleRemoteDescription(desc, offerId)
 }
 
 // the client handles answer on the publisher PC
-func (c *RTCClient) handleAnswer(desc webrtc.SessionDescription) {
+func (c *RTCClient) handleAnswer(desc webrtc.SessionDescription, answerId uint32) {
 	logger.Infow("handling server answer", "participant", c.localParticipant.Identity)
 
 	c.lastAnswer.Store(&desc)
 	// remote answered the offer, establish connection
-	c.publisher.HandleRemoteDescription(desc)
+	c.publisher.HandleRemoteDescription(desc, answerId)
 }
 
-func (c *RTCClient) onOffer(offer webrtc.SessionDescription) error {
+func (c *RTCClient) onOffer(offer webrtc.SessionDescription, offerId uint32) error {
 	if c.localParticipant != nil {
 		logger.Infow("starting negotiation", "participant", c.localParticipant.Identity)
 	}
 	return c.SendRequest(&livekit.SignalRequest{
 		Message: &livekit.SignalRequest_Offer{
-			Offer: rtc.ToProtoSessionDescription(offer),
+			Offer: rtc.ToProtoSessionDescription(offer, offerId),
 		},
 	})
 }

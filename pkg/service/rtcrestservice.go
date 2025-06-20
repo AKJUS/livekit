@@ -91,7 +91,6 @@ func (s *RTCRestService) handleGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *RTCRestService) handleOptions(w http.ResponseWriter, r *http.Request) {
-	logger.Infow("RAJA got here to options", "req", r) // REMOVE
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "PATCH, OPTIONS, GET, POST, DELETE")
@@ -124,10 +123,6 @@ func (s *RTCRestService) validateCreate(r *http.Request) (*createRequest, int, e
 		return nil, http.StatusUnauthorized, rtc.ErrPermissionDenied
 	}
 
-	if err := EnsureCreatePermission(r.Context()); err != nil {
-		return nil, http.StatusUnauthorized, err
-	}
-
 	roomName, err := EnsureJoinPermission(r.Context())
 	if err != nil {
 		return nil, http.StatusUnauthorized, err
@@ -135,15 +130,15 @@ func (s *RTCRestService) validateCreate(r *http.Request) (*createRequest, int, e
 	if roomName == "" {
 		return nil, http.StatusUnauthorized, errors.New("room name cannot be empty")
 	}
-	if limit := s.config.Limit.MaxRoomNameLength; limit > 0 && len(roomName) > limit {
-		return nil, http.StatusBadRequest, fmt.Errorf("%w: max length %d", ErrRoomNameExceedsLimits, limit)
+	if !s.config.Limit.CheckRoomNameLength(string(roomName)) {
+		return nil, http.StatusBadRequest, fmt.Errorf("%w: max length %d", ErrRoomNameExceedsLimits, s.config.Limit.MaxRoomNameLength)
 	}
 
 	if claims.Identity == "" {
 		return nil, http.StatusBadRequest, ErrIdentityEmpty
 	}
-	if limit := s.config.Limit.MaxParticipantIdentityLength; limit > 0 && len(claims.Identity) > limit {
-		return nil, http.StatusBadRequest, fmt.Errorf("%w: max length %d", ErrParticipantIdentityExceedsLimits, limit)
+	if !s.config.Limit.CheckParticipantIdentityLength(claims.Identity) {
+		return nil, http.StatusBadRequest, fmt.Errorf("%w: max length %d", ErrParticipantIdentityExceedsLimits, s.config.Limit.MaxParticipantIdentityLength)
 	}
 
 	var clientInfo struct {
@@ -161,6 +156,9 @@ func (s *RTCRestService) validateCreate(r *http.Request) (*createRequest, int, e
 	if err != nil {
 		return nil, http.StatusBadRequest, fmt.Errorf("body does not have SDP offer: %s", err)
 	}
+	if len(offerSDPBytes) == 0 {
+		return nil, http.StatusBadRequest, errors.New("body does not have SDP offer")
+	}
 	offerSDP := string(offerSDPBytes)
 	sd := &webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
@@ -171,14 +169,18 @@ func (s *RTCRestService) validateCreate(r *http.Request) (*createRequest, int, e
 		return nil, http.StatusBadRequest, fmt.Errorf("malformed SDP offer: %s", err)
 	}
 
+	ci := ParseClientInfo(r)
+	if ci.Protocol == 0 {
+		// if no client info available (which will be mostly the case with WHIP clients), at least set protocol
+		ci.Protocol = types.CurrentProtocol
+	}
+
 	pi := routing.ParticipantInit{
 		Identity:      livekit.ParticipantIdentity(claims.Identity),
 		Name:          livekit.ParticipantName(claims.Name),
 		AutoSubscribe: true,
-		Client: &livekit.ClientInfo{
-			Protocol: types.CurrentProtocol,
-		},
-		Grants: claims,
+		Client:        ci,
+		Grants:        claims,
 		CreateRoom: &livekit.CreateRoomRequest{
 			Name:       string(roomName),
 			RoomPreset: claims.RoomPreset,

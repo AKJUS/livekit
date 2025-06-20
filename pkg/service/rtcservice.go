@@ -16,6 +16,8 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -26,9 +28,12 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/ua-parser/uap-go/uaparser"
 	"go.uber.org/atomic"
 	"golang.org/x/exp/maps"
+
+	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
+	"github.com/livekit/psrpc"
 
 	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
@@ -37,9 +42,6 @@ import (
 	"github.com/livekit/livekit-server/pkg/telemetry"
 	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 	"github.com/livekit/livekit-server/pkg/utils"
-	"github.com/livekit/protocol/livekit"
-	"github.com/livekit/protocol/logger"
-	"github.com/livekit/psrpc"
 )
 
 type RTCService struct {
@@ -49,7 +51,6 @@ type RTCService struct {
 	config        *config.Config
 	isDev         bool
 	limits        config.LimitConfig
-	parser        *uaparser.Parser
 	telemetry     telemetry.TelemetryService
 
 	mu          sync.Mutex
@@ -68,7 +69,6 @@ func NewRTCService(
 		config:        conf,
 		isDev:         conf.Development,
 		limits:        conf.Limit,
-		parser:        uaparser.NewFromSaved(),
 		telemetry:     telemetry,
 		connections:   map[*websocket.Conn]struct{}{},
 	}
@@ -91,7 +91,8 @@ func (s *RTCService) SetupRoutes(mux *http.ServeMux) {
 }
 
 func (s *RTCService) validate(w http.ResponseWriter, r *http.Request) {
-	_, _, code, err := s.validateInternal(r)
+	log := utils.GetLogger(r.Context())
+	_, _, code, err := s.validateInternal(log, r, true)
 	if err != nil {
 		HandleError(w, r, code, err)
 		return
@@ -99,7 +100,19 @@ func (s *RTCService) validate(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("success"))
 }
 
-func (s *RTCService) validateInternal(r *http.Request) (livekit.RoomName, routing.ParticipantInit, int, error) {
+func decodeAttributes(str string) (map[string]string, error) {
+	data, err := base64.URLEncoding.DecodeString(str)
+	if err != nil {
+		return nil, err
+	}
+	var attrs map[string]string
+	if err := json.Unmarshal(data, &attrs); err != nil {
+		return nil, err
+	}
+	return attrs, nil
+}
+
+func (s *RTCService) validateInternal(log logger.Logger, r *http.Request, strict bool) (livekit.RoomName, routing.ParticipantInit, int, error) {
 	claims := GetGrants(r.Context())
 	var pi routing.ParticipantInit
 
@@ -116,8 +129,15 @@ func (s *RTCService) validateInternal(r *http.Request) (livekit.RoomName, routin
 	if claims.Identity == "" {
 		return "", pi, http.StatusBadRequest, ErrIdentityEmpty
 	}
-	if limit := s.config.Limit.MaxParticipantIdentityLength; limit > 0 && len(claims.Identity) > limit {
-		return "", pi, http.StatusBadRequest, fmt.Errorf("%w: max length %d", ErrParticipantIdentityExceedsLimits, limit)
+	if !s.config.Limit.CheckParticipantIdentityLength(claims.Identity) {
+		return "", pi, http.StatusBadRequest, fmt.Errorf("%w: max length %d", ErrParticipantIdentityExceedsLimits, s.config.Limit.MaxParticipantIdentityLength)
+	}
+
+	if claims.RoomConfig != nil {
+		if err := claims.RoomConfig.CheckCredentials(); err != nil {
+			logger.Warnw("credentials found in token", nil)
+			// TODO(dz): in a future version, we'll reject these connections
+		}
 	}
 
 	roomName := livekit.RoomName(r.FormValue("room"))
@@ -129,12 +149,13 @@ func (s *RTCService) validateInternal(r *http.Request) (livekit.RoomName, routin
 	participantID := r.FormValue("sid")
 	subscriberAllowPauseParam := r.FormValue("subscriber_allow_pause")
 	disableICELite := r.FormValue("disable_ice_lite")
+	attributesStr := r.FormValue("attributes")
 
 	if onlyName != "" {
 		roomName = onlyName
 	}
-	if limit := s.config.Limit.MaxRoomNameLength; limit > 0 && len(roomName) > limit {
-		return "", pi, http.StatusBadRequest, fmt.Errorf("%w: max length %d", ErrRoomNameExceedsLimits, limit)
+	if !s.config.Limit.CheckRoomNameLength(string(roomName)) {
+		return "", pi, http.StatusBadRequest, fmt.Errorf("%w: max length %d", ErrRoomNameExceedsLimits, s.config.Limit.MaxRoomNameLength)
 	}
 
 	// this is new connection for existing participant -  with publish only permissions
@@ -174,13 +195,38 @@ func (s *RTCService) validateInternal(r *http.Request) (livekit.RoomName, routin
 	}
 	SetRoomConfiguration(createRequest, claims.GetRoomConfiguration())
 
+	// Add extra attributes to the participant
+	if attributesStr != "" {
+		// Make sure grant has GetCanUpdateOwnMetadata set
+		if !claims.Video.GetCanUpdateOwnMetadata() {
+			return "", routing.ParticipantInit{}, http.StatusUnauthorized, rtc.ErrPermissionDenied
+		}
+		attrs, err := decodeAttributes(attributesStr)
+		if err != nil {
+			if strict {
+				return "", pi, http.StatusBadRequest, errors.New("cannot decode attributes")
+			}
+			log.Debugw("failed to decode attributes", "error", err)
+			// attrs will be empty here, so just proceed
+		}
+		if len(attrs) != 0 && claims.Attributes == nil {
+			claims.Attributes = make(map[string]string, len(attrs))
+		}
+		for k, v := range attrs {
+			if v == "" {
+				continue // do not allow deleting existing attributes
+			}
+			claims.Attributes[k] = v
+		}
+	}
+
 	pi = routing.ParticipantInit{
 		Reconnect:       boolValue(reconnectParam),
 		ReconnectReason: livekit.ReconnectReason(reconnectReason),
 		Identity:        livekit.ParticipantIdentity(claims.Identity),
 		Name:            livekit.ParticipantName(claims.Name),
 		AutoSubscribe:   true,
-		Client:          s.ParseClientInfo(r),
+		Client:          ParseClientInfo(r),
 		Grants:          claims,
 		Region:          region,
 		CreateRoom:      createRequest,
@@ -257,7 +303,7 @@ func (s *RTCService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		loggerResolved = false
 	}
 
-	roomName, pi, code, err = s.validateInternal(r)
+	roomName, pi, code, err = s.validateInternal(pLogger, r, false)
 	if err != nil {
 		HandleError(w, r, code, err)
 		return
@@ -421,6 +467,7 @@ func (s *RTCService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					pLogger.Debugw("sending participant update", "participantUpdate", m)
 				case *livekit.SignalResponse_RoomMoved:
 					resetLogger()
+					signalStats.Reset()
 					roomName = livekit.RoomName(m.RoomMoved.GetRoom().GetName())
 					moveRoomID := livekit.RoomID(m.RoomMoved.GetRoom().GetSid())
 					if moveRoomID != "" {
@@ -429,6 +476,8 @@ func (s *RTCService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					participantIdentity = livekit.ParticipantIdentity(m.RoomMoved.GetParticipant().GetIdentity())
 					pID = livekit.ParticipantID(m.RoomMoved.GetParticipant().GetSid())
 					resolveLogger(false)
+					signalStats.ResolveRoom(m.RoomMoved.GetRoom())
+					signalStats.ResolveParticipant(m.RoomMoved.GetParticipant())
 					pLogger.Debugw("sending room moved", "roomMoved", m)
 				}
 
@@ -495,77 +544,6 @@ func (s *RTCService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-}
-
-func (s *RTCService) ParseClientInfo(r *http.Request) *livekit.ClientInfo {
-	values := r.Form
-	ci := &livekit.ClientInfo{}
-	if pv, err := strconv.Atoi(values.Get("protocol")); err == nil {
-		ci.Protocol = int32(pv)
-	}
-	sdkString := values.Get("sdk")
-	switch sdkString {
-	case "js":
-		ci.Sdk = livekit.ClientInfo_JS
-	case "ios", "swift":
-		ci.Sdk = livekit.ClientInfo_SWIFT
-	case "android":
-		ci.Sdk = livekit.ClientInfo_ANDROID
-	case "flutter":
-		ci.Sdk = livekit.ClientInfo_FLUTTER
-	case "go":
-		ci.Sdk = livekit.ClientInfo_GO
-	case "unity":
-		ci.Sdk = livekit.ClientInfo_UNITY
-	case "reactnative":
-		ci.Sdk = livekit.ClientInfo_REACT_NATIVE
-	case "rust":
-		ci.Sdk = livekit.ClientInfo_RUST
-	case "python":
-		ci.Sdk = livekit.ClientInfo_PYTHON
-	case "cpp":
-		ci.Sdk = livekit.ClientInfo_CPP
-	case "unityweb":
-		ci.Sdk = livekit.ClientInfo_UNITY_WEB
-	case "node":
-		ci.Sdk = livekit.ClientInfo_NODE
-	}
-
-	ci.Version = values.Get("version")
-	ci.Os = values.Get("os")
-	ci.OsVersion = values.Get("os_version")
-	ci.Browser = values.Get("browser")
-	ci.BrowserVersion = values.Get("browser_version")
-	ci.DeviceModel = values.Get("device_model")
-	ci.Network = values.Get("network")
-	// get real address (forwarded http header) - check Cloudflare headers first, fall back to X-Forwarded-For
-	ci.Address = GetClientIP(r)
-
-	// attempt to parse types for SDKs that support browser as a platform
-	if ci.Sdk == livekit.ClientInfo_JS ||
-		ci.Sdk == livekit.ClientInfo_REACT_NATIVE ||
-		ci.Sdk == livekit.ClientInfo_FLUTTER ||
-		ci.Sdk == livekit.ClientInfo_UNITY {
-		client := s.parser.Parse(r.UserAgent())
-		if ci.Browser == "" {
-			ci.Browser = client.UserAgent.Family
-			ci.BrowserVersion = client.UserAgent.ToVersionString()
-		}
-		if ci.Os == "" {
-			ci.Os = client.Os.Family
-			ci.OsVersion = client.Os.ToVersionString()
-		}
-		if ci.DeviceModel == "" {
-			model := client.Device.Family
-			if model != "" && client.Device.Model != "" && model != client.Device.Model {
-				model += " " + client.Device.Model
-			}
-
-			ci.DeviceModel = model
-		}
-	}
-
-	return ci
 }
 
 func (s *RTCService) DrainConnections(interval time.Duration) {
